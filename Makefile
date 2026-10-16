@@ -1,14 +1,15 @@
--include ../local.mk
-
-LLVM_BUILD_DIR = $(shell $(LLVM_CONFIG) --obj-root)
-LLVM_BIN       = $(shell $(LLVM_CONFIG) --bindir)
-LLVM_CMAKE_DIR = $(LLVM_BUILD_DIR)/lib/cmake/llvm
-CC             = clang
-CXX            = clang++
-OPT            = $(LLVM_BIN)/opt
-LLC            = $(LLVM_BIN)/llc
-LLINK          = $(LLVM_BIN)/llvm-link
-OML            = -O3
+LLVM_CONFIG     = llvm-config
+LLVM_BIN        = $(shell $(LLVM_CONFIG) --bindir)
+LLVM_LIB        = $(shell $(LLVM_CONFIG) --libdir)
+LLVM_BUILD_ROOT = $(shell $(LLVM_CONFIG) --obj-root)
+LLVM_SRC_ROOT   = $(LLVM_BUILD_ROOT)/../llvm
+LLVM_CMAKE_DIR  = $(LLVM_BUILD_DIR)/lib/cmake/llvm
+CC              = $(LLVM_BIN)/clang
+CXX             = $(LLVM_BIN)/clang++
+OPT             = $(LLVM_BIN)/opt
+LLC             = $(LLVM_BIN)/llc
+LLINK           = $(LLVM_BIN)/llvm-link
+OML             = -O3
 
 all:
 	mkdir -p build
@@ -18,6 +19,9 @@ all:
 		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
 		..
 	$(MAKE) -C build
+
+compdb:
+	bear -- $(MAKE) -B all
 
 clean:
 	rm -rf build
