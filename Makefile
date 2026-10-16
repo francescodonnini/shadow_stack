@@ -1,11 +1,10 @@
 -include local.mk
 
-LLVM_CONFIG     ?= llvm-config
 LLVM_BIN        =  $(shell $(LLVM_CONFIG) --bindir)
 LLVM_LIB        =  $(shell $(LLVM_CONFIG) --libdir)
 LLVM_BUILD_ROOT =  $(shell $(LLVM_CONFIG) --obj-root)
+LLVM_CMAKE_DIR  = $(shell $(LLVM_CONFIG) --cmakedir)
 LLVM_SRC_ROOT   =  $(LLVM_BUILD_ROOT)/../llvm
-LLVM_CMAKE_DIR  =  $(LLVM_BUILD_DIR)/lib/cmake/llvm
 CC              =  $(LLVM_BIN)/clang
 CXX             =  $(LLVM_BIN)/clang++
 OPT             =  $(LLVM_BIN)/opt
