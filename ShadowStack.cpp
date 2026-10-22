@@ -20,6 +20,9 @@ STATISTIC(NumSkippedSCEV, "Number of masks skipped (Scalar Evolution)");
 STATISTIC(NumSkippedDomTree, "Number of masks skipped (Dominator Tree)");
 STATISTIC(NumStoresInstrumented, "Number of masks actually injected");
 
+static constexpr unsigned GuardBit = 47;
+static constexpr uint64_t ClearMask = ~(1ULL << GuardBit);
+
 PreservedAnalyses SSFunctionPass::run(Function &F,
                                       FunctionAnalysisManager &FAM) {
   if (F.isDeclaration()) {
@@ -50,17 +53,15 @@ void SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT,
 
   auto &EntryBB = F.getEntryBlock();
   IRBuilder<> Builder(&EntryBB, EntryBB.getFirstNonPHIIt());
-  auto Mask = Builder.getInt64(MASK);
 
   DenseMap<Value *, Value *> MaskedPtrs;
   for (auto SI : Stores) {
-    instrumentStore(F, *SI, MASK, Mask, DT, SE, MaskedPtrs);
+    instrumentStore(F, *SI, DT, SE, MaskedPtrs);
   }
 }
 
-void SSFunctionPass::instrumentStore(Function &F, StoreInst &I, uint64_t Mask,
-                                     Value *MaskVal, DominatorTree &DT,
-                                     ScalarEvolution &SE,
+void SSFunctionPass::instrumentStore(Function &F, StoreInst &I,
+                                     DominatorTree &DT, ScalarEvolution &SE,
                                      DenseMap<Value *, Value *> &MaskedPtrs) {
   NumStoresSeen++;
 #if defined(OPT_ALL) || defined(KNOWNBITS_OPT)
@@ -82,44 +83,41 @@ void SSFunctionPass::instrumentStore(Function &F, StoreInst &I, uint64_t Mask,
   auto *M = F.getParent();
   auto *I64Ty = Builder.getInt64Ty();
   auto *I64PtrTy = PointerType::getUnqual(I64Ty);
-
   auto *DstPtr = I.getPointerOperand();
+  auto *PtrTy = DstPtr->getType();
+  auto *IdxTy = F.getParent()->getDataLayout().getIndexType(PtrTy);
   auto *DstI64 = Builder.CreatePtrToInt(DstPtr, Builder.getInt64Ty());
-  auto *MaskedInt = Builder.CreateAnd(DstI64, MaskVal, "masked_adr");
-  auto *MaskedPtr = Builder.CreateIntToPtr(MaskedInt, DstPtr->getType());
-
+  auto *MaskedPtr = Builder.CreateIntrinsic(
+      Intrinsic::ptrmask, {PtrTy, IdxTy},
+      {DstPtr, ConstantInt::get(IdxTy, ClearMask)}, nullptr, "masked_adr");
   I.setOperand(I.getPointerOperandIndex(), MaskedPtr);
-
   MaskedPtrs[DstPtr] = MaskedPtr;
-
   NumStoresInstrumented++;
 }
 
 bool SSFunctionPass::knownBitsOpt(Function &F, StoreInst &I, uint64_t Mask,
                                   DominatorTree &DT, ScalarEvolution &SE) {
-  auto *DstPtr = I.getPointerOperand();
   const auto &DL = F.getParent()->getDataLayout();
-  auto Known = computeKnownBits(DstPtr, DL);
+  auto Known = computeKnownBits(I.getPointerOperand(), DL);
   auto BitsToClear = ~Mask;
-  if ((Known.Zero.getZExtValue() & BitsToClear) == BitsToClear) {
+  if (Known.Zero[GuardBit]) {
     NumSkippedKnownBits++;
     return true;
   }
+
   return false;
 }
 
 bool SSFunctionPass::scalarEvolutionOpt(StoreInst &I, uint64_t Mask,
                                         DominatorTree &DT,
                                         ScalarEvolution &SE) {
-  auto *DstPtr = I.getPointerOperand();
-  const auto &SCEV = SE.getSCEV(DstPtr);
-  auto PtrRange = SE.getUnsignedRange(SCEV);
-  auto MaxValue = PtrRange.getUnsignedMax();
-  APInt APMask(MaxValue.getBitWidth(), Mask);
-  if ((MaxValue & ~APMask).isZero()) {
+  auto Range = SE.getUnsignedRange(SE.getSCEV(I.getPointerOperand()));
+  auto Max = Range.getUnsignedMax();
+  if (Max.ult(APInt::getOneBitSet(Max.getBitWidth(), GuardBit))) {
     NumSkippedSCEV++;
     return true;
   }
+
   return false;
 }
 
@@ -135,6 +133,7 @@ bool SSFunctionPass::domTreeOpt(StoreInst &I, DominatorTree &DT,
       return true;
     }
   }
+
   return false;
 }
 

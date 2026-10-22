@@ -10,27 +10,34 @@ namespace llvm {
 class Function;
 
 struct SSFunctionPass : public PassInfoMixin<SSFunctionPass> {
-    SSFunctionPass(bool instrumentFun = true, bool instrumentStore = true)
-        :_instrumentFun(instrumentFun), _instrumentStore(instrumentStore) {
-            errs() << "[ss] Function Instrumentation: " << (instrumentFun ? "ON" : "OFF") << ", Store Instrumentation: " << (instrumentStore ? "ON" : "OFF") << "\n";
-        }
+  SSFunctionPass(bool instrumentFun = true, bool instrumentStore = true)
+      : _instrumentFun(instrumentFun), _instrumentStore(instrumentStore) {
+    errs() << "[ss] Function Instrumentation: "
+           << (instrumentFun ? "ON" : "OFF")
+           << ", Store Instrumentation: " << (instrumentStore ? "ON" : "OFF")
+           << "\n";
+  }
 
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+
 private:
-    constexpr static auto MASK = 0x7fffffffffffULL;
+  bool _instrumentFun;
+  bool _instrumentStore;
 
-    bool _instrumentFun;
-    bool _instrumentStore;
+  void instrumentStores(Function &F, DominatorTree &DT, ScalarEvolution &SE);
 
-    void instrumentStores(Function &F, DominatorTree &DT, ScalarEvolution &SE);
+  void instrumentStore(Function &F, StoreInst &I, DominatorTree &DT,
+                       ScalarEvolution &SE,
+                       DenseMap<Value *, Value *> &MaskedPtrs);
 
-    void instrumentStore(Function &F, StoreInst &I, uint64_t Mask, Value *MaskVal, DominatorTree &DT, ScalarEvolution &SE, DenseMap<Value*, Value*> &MaskedPtrs);
-    
-    bool knownBitsOpt(Function &F, StoreInst &I, uint64_t Mask, DominatorTree &DT, ScalarEvolution &SE);
-    
-    bool scalarEvolutionOpt(StoreInst &I, uint64_t Mask, DominatorTree &DT, ScalarEvolution &SE);
-    
-    bool domTreeOpt(StoreInst &I, DominatorTree &DT, DenseMap<Value*, Value*> &MaskedPtrs);
+  bool knownBitsOpt(Function &F, StoreInst &I, uint64_t Mask, DominatorTree &DT,
+                    ScalarEvolution &SE);
+
+  bool scalarEvolutionOpt(StoreInst &I, uint64_t Mask, DominatorTree &DT,
+                          ScalarEvolution &SE);
+
+  bool domTreeOpt(StoreInst &I, DominatorTree &DT,
+                  DenseMap<Value *, Value *> &MaskedPtrs);
 };
-}
+} // namespace llvm
 #endif
