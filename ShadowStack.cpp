@@ -140,11 +140,11 @@ bool SSFunctionPass::domTreeOpt(StoreInst &I, DominatorTree &DT,
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "ShadowStack", "v0.1", [](PassBuilder &PB) {
-            PB.registerPipelineStartEPCallback([](ModulePassManager &MPM,
-                                                  OptimizationLevel OL) {
+            PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel OL,
+                                                  ThinOrFullLTOPhase) {
               MPM.addPass(createModuleToFunctionPassAdaptor(SSFunctionPass()));
             });
-
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {

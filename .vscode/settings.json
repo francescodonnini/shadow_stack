@@ -14,5 +14,6 @@
         "*.h": "c",
         "Kbuild": "makefile",
         "**/Kbuild": "makefile"
-    }
+    },
+    "makefile.configureOnOpen": false
 }
