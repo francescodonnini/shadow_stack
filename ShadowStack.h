@@ -1,7 +1,5 @@
 #ifndef STRICT_OPT_H
 #define STRICT_OPT_H
-#include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PassManager.h"
@@ -11,12 +9,7 @@ class Function;
 
 struct SSFunctionPass : public PassInfoMixin<SSFunctionPass> {
   SSFunctionPass(bool instrumentFun = true, bool instrumentStore = true)
-      : _instrumentFun(instrumentFun), _instrumentStore(instrumentStore) {
-    errs() << "[ss] Function Instrumentation: "
-           << (instrumentFun ? "ON" : "OFF")
-           << ", Store Instrumentation: " << (instrumentStore ? "ON" : "OFF")
-           << "\n";
-  }
+      : _instrumentFun(instrumentFun), _instrumentStore(instrumentStore) {}
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 
@@ -24,20 +17,14 @@ private:
   bool _instrumentFun;
   bool _instrumentStore;
 
-  void instrumentStores(Function &F, DominatorTree &DT, ScalarEvolution &SE);
+  void instrumentStores(Function &F, DominatorTree &DT);
 
   void instrumentStore(Function &F, StoreInst &I, DominatorTree &DT,
-                       ScalarEvolution &SE,
                        DenseMap<Value *, Value *> &MaskedPtrs);
+};
 
-  bool knownBitsOpt(Function &F, StoreInst &I, uint64_t Mask, DominatorTree &DT,
-                    ScalarEvolution &SE);
-
-  bool scalarEvolutionOpt(StoreInst &I, uint64_t Mask, DominatorTree &DT,
-                          ScalarEvolution &SE);
-
-  bool domTreeOpt(StoreInst &I, DominatorTree &DT,
-                  DenseMap<Value *, Value *> &MaskedPtrs);
+struct SSReportPass : public PassInfoMixin<SSReportPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
 };
 } // namespace llvm
 #endif

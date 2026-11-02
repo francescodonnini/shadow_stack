@@ -7,11 +7,6 @@ find_package(LLVM REQUIRED CONFIG)
 
 message(STATUS "Using LLVM ${LLVM_PACKAGE_VERSION}")
 
-option(OPTS_ALL "Enable all optimizations" OFF)
-if(OPTS_ALL)
-    add_definitions(-DOPT_ALL)
-endif()
-
 add_definitions(${LLVM_DEFINITIONS})
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIR})
@@ -26,3 +21,16 @@ endif()
 
 add_llvm_pass_plugin(ShadowStack
     ShadowStack.cpp)
+
+option(OPT_CONSTADDR "Skip stores at constant offsets in locals/globals" ON)
+option(OPT_DOMTREE   "Reuse a dominating mask of the same pointer"       ON)
+option(OPT_KNOWNBITS "Skip stores whose bit 47 is known to be zero"      OFF)
+option(OPTS_ALL      "Enable all the optimizations above"                OFF)
+
+foreach(opt CONSTADDR DOMTREE KNOWNBITS)
+    if(OPTS_ALL OR OPT_${opt})
+        target_compile_definitions(ShadowStack PRIVATE ${opt}_OPT)
+        list(APPEND enabled_opts ${opt})
+    endif()
+endforeach()
+message(STATUS "Shadow stack optimizations: ${enabled_opts}")
