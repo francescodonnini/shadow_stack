@@ -33,4 +33,13 @@ foreach(opt CONSTADDR DOMTREE KNOWNBITS)
         list(APPEND enabled_opts ${opt})
     endif()
 endforeach()
+
+option(MASK_BTR_ASM "Mask with btrq $47 (inline asm) instead of llvm.ptrmask" OFF)
+if(MASK_BTR_ASM)
+    target_compile_definitions(ShadowStack PRIVATE BTR_ASM)
+    message(STATUS "Mask instruction: btrq")
+else()
+    message(STATUS "Mask instruction: ptrmask")
+endif()
+
 message(STATUS "Shadow stack optimizations: ${enabled_opts}")

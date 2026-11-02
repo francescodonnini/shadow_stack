@@ -125,7 +125,6 @@ void SSFunctionPass::instrumentStore(Function &F, StoreInst &I,
     return;
   }
 #endif
-
 #if defined(DOMTREE_OPT)
   if (domTreeOpt(I, DT, MaskedPtrs)) {
     NumSkippedDomTree++;
@@ -136,10 +135,16 @@ void SSFunctionPass::instrumentStore(Function &F, StoreInst &I,
   IRBuilder<> Builder(&I);
   auto *DstPtr = I.getPointerOperand();
   auto *PtrTy = DstPtr->getType();
+#if defined(BTR_ASM)
+  auto *AsmTy = FunctionType::get(PtrTy, {PtrTy}, false);
+  auto *Btr = InlineAsm::get(AsmTy, "btrq $$47, $0", "=r,0,~{flags}", false);
+  auto *MaskedPtr = Builder.CreateCall(AsmTy, Btr, {DstPtr}, "masked_adr");
+#else
   auto *IdxTy = F.getParent()->getDataLayout().getIndexType(PtrTy);
   auto *MaskedPtr = Builder.CreateIntrinsic(
       Intrinsic::ptrmask, {PtrTy, IdxTy},
       {DstPtr, ConstantInt::get(IdxTy, ClearMask)}, nullptr, "masked_adr");
+#endif
   I.setOperand(I.getPointerOperandIndex(), MaskedPtr);
   MaskedPtrs[DstPtr] = MaskedPtr;
   NumStoresInstrumented++;
