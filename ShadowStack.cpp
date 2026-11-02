@@ -148,9 +148,9 @@ void SSFunctionPass::instrumentStore(Function &F, StoreInst &I,
 PreservedAnalyses SSReportPass::run(Module &M, ModuleAnalysisManager &MAM) {
   static constexpr unsigned N = 6;
   static uint64_t Prev[N];
-  uint64_t Now[N] = {NumFunctions,        NumStoresSeen,
-                     NumSkippedKnownBits, NumSkippedDomTree,
-                     NumSkippedConstAddr, NumStoresInstrumented};
+  uint64_t Now[N] = {NumFunctions,          NumStoresSeen,
+                     NumStoresInstrumented, NumSkippedConstAddr,
+                     NumSkippedKnownBits,   NumSkippedDomTree};
   uint64_t D[N];
 
   for (unsigned i = 0; i < N; ++i) {
@@ -158,7 +158,7 @@ PreservedAnalyses SSReportPass::run(Module &M, ModuleAnalysisManager &MAM) {
     Prev[i] = Now[i];
   }
 
-  const auto Dest = std::getenv("SS_LOG");
+  const auto Dest = std::getenv("SS_REPORT_DEST");
   if (!Dest || !*Dest) {
     return PreservedAnalyses::all();
   }
