@@ -8,35 +8,105 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/KnownBits.h"
 #include <cstdlib>
+#include <iterator>
+#include <optional>
+#include <type_traits>
 
 #define DEBUG_TYPE "shadow-stack-opt"
 
 using namespace llvm;
 
-STATISTIC(NumFunctions, "Number of functions with at least one store");
+STATISTIC(NumFunctions, "Number of functions with at least one store to mask");
 STATISTIC(NumStoresSeen, "Total number of stores evaluated");
+STATISTIC(NumStoresInstrumented, "Number of masks actually injected");
+STATISTIC(NumStoreInst, "Number of simple stores");
+STATISTIC(NumAtomicRMW, "Number of atomic RMW");
+STATISTIC(NumCmpXchg, "Number of cmp-xchg");
+STATISTIC(NumMemIntrinsics, "Number of LLVM memory intrinsics");
+STATISTIC(NumMaskedStore, "Number of llvm.masked.store calls");
+STATISTIC(NumScatter, "Number of llvm.masked.scatter calls");
+STATISTIC(NumVectorStores, "Number of stores of vector type");
+STATISTIC(NumUnhandledWrites,
+          "Number of arch-specific intrinsics not recognized by LLVM");
+STATISTIC(NumSkippedAlreadyMasked,
+          "Number of stores already mask and processed two or more times");
+STATISTIC(NumInlineAsm, "Number of inline asm code sections");
+STATISTIC(NumExternalCallsMayWrite,
+          "Number of function call not defined in the module");
 STATISTIC(NumSkippedKnownBits, "Number of masks skipped (Known Bits)");
 STATISTIC(NumSkippedDomTree, "Number of masks skipped (Dominator Tree)");
 STATISTIC(NumSkippedConstAddr,
           "Number of masks skipped (constant offset in a local or global)");
-STATISTIC(NumStoresInstrumented, "Number of masks actually injected");
+
+namespace {
+using TStat = std::remove_reference_t<decltype(NumFunctions)>;
+struct ColumnValue {
+  const char *Name;
+  const TStat *Stat;
+};
+
+enum ColumnIndex : size_t {
+  IdxFunctions,
+  IdxSeen,
+  IdxInstrumented,
+  IdxAlreadyMasked,
+  IdxSkipConstAddr,
+  IdxSkipKnownBits,
+  IdxSkipDomTree,
+  IdxStoreInst,
+  IdxVectorStores,
+  IdxAtomicRMW,
+  IdxCmpXchg,
+  IdxMemIntrinsics,
+  IdxMaskedStore,
+  IdxScatter,
+  IdxUnhandledWrites,
+  IdxInlineAsm,
+  IdxExternalCalls,
+  IdxNum
+};
+} // namespace
+
+static const ColumnValue Columns[] = {
+    {"functions", &NumFunctions},
+    {"stores_seen", &NumStoresSeen},
+    {"instrumented", &NumStoresInstrumented},
+    {"already_masked", &NumSkippedAlreadyMasked},
+    {"skipped_constaddr", &NumSkippedConstAddr},
+    {"skipped_knownbits", &NumSkippedKnownBits},
+    {"skipped_domtree", &NumSkippedDomTree},
+    {"store_inst", &NumStoreInst},
+    {"vector_stores", &NumVectorStores},
+    {"atomic_rmw", &NumAtomicRMW},
+    {"cmpxchg", &NumCmpXchg},
+    {"mem_intrinsics", &NumMemIntrinsics},
+    {"masked_store", &NumMaskedStore},
+    {"scatter", &NumScatter},
+    {"unhandled_writes", &NumUnhandledWrites},
+    {"inline_asm", &NumInlineAsm},
+    {"external_calls_may_write", &NumExternalCallsMayWrite},
+};
+static constexpr size_t NumColumns = std::size(Columns);
+static_assert(NumColumns == IdxNum,
+              "Columns array is out of sync with ColumnIndex enum");
 
 static constexpr unsigned GuardBit = 47;
 static constexpr uint64_t ClearMask = ~(1ULL << GuardBit);
 
-static bool domTreeOpt(StoreInst &I, DominatorTree &DT,
+static bool domTreeOpt(Use &U, DominatorTree &DT,
                        DenseMap<Value *, Value *> &MaskedPtrs) {
-  auto *DstPtr = I.getPointerOperand();
-  if (MaskedPtrs.count(DstPtr)) {
-    auto *PrevMaskedPtr = MaskedPtrs[DstPtr];
-    auto *PrevInst = dyn_cast<Instruction>(PrevMaskedPtr);
-    if (!PrevInst || DT.dominates(PrevInst, &I)) {
-      I.setOperand(I.getPointerOperandIndex(), PrevMaskedPtr);
-      return true;
-    }
+  auto It = MaskedPtrs.find(U.get());
+  if (It == MaskedPtrs.end()) {
+    return false;
   }
 
-  return false;
+  auto *Prev = dyn_cast<Instruction>(It->second);
+  if (Prev && !DT.dominates(Prev, cast<Instruction>(U.getUser()))) {
+    return false;
+  }
+
+  U.set(It->second);
+  return true;
 }
 
 static bool isConstantAddressInObject(StoreInst &I, const DataLayout &DL) {
@@ -67,10 +137,10 @@ static bool isConstantAddressInObject(StoreInst &I, const DataLayout &DL) {
   return Off.getZExtValue() + StoreSize.getFixedValue() <= ObjSize;
 }
 
-static bool isGuardBitKnownZero(StoreInst &I, const DataLayout &DL,
+static bool isGuardBitKnownZero(Use &U, const DataLayout &DL,
                                 DominatorTree &DT) {
-  auto Known = computeKnownBits(I.getPointerOperand(), DL, 0, nullptr, &I, &DT);
-  return Known.Zero[GuardBit];
+  auto *I = cast<Instruction>(U.getUser());
+  return computeKnownBits(U.get(), DL, 0, nullptr, I, &DT).Zero[GuardBit];
 }
 
 PreservedAnalyses SSFunctionPass::run(Function &F,
@@ -79,88 +149,210 @@ PreservedAnalyses SSFunctionPass::run(Function &F,
     return PreservedAnalyses::all();
   }
 
+  auto Changed = false;
   if (_instrumentStore) {
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-    instrumentStores(F, DT);
+    Changed = instrumentStores(F, DT);
   }
 
-  return PreservedAnalyses::none();
+  if (!Changed) {
+    return PreservedAnalyses::all();
+  }
+
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
 }
 
-void SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
-  SmallVector<StoreInst *, 8> Stores;
+static std::optional<Use *> getUse(Instruction &I) {
+  if (auto *SI = dyn_cast<StoreInst>(&I)) {
+    return std::optional{
+        &SI->getOperandUse(StoreInst::getPointerOperandIndex())};
+  }
+
+  if (isa<AtomicRMWInst>(&I)) {
+    return std::optional{
+        &I.getOperandUse(AtomicRMWInst::getPointerOperandIndex())};
+  }
+
+  if (isa<AtomicCmpXchgInst>(&I)) {
+    return std::optional{
+        &I.getOperandUse(AtomicCmpXchgInst::getPointerOperandIndex())};
+  }
+
+  // memset/memcpy/memmove
+  if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+    return std::optional{&MI->getRawDestUse()};
+  }
+
+  if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::masked_store:
+      return std::optional{&II->getArgOperandUse(1)};
+    case Intrinsic::masked_scatter:
+      return std::optional{&II->getArgOperandUse(1)};
+    default:
+      break;
+    }
+  }
+
+  return std::nullopt;
+}
+
+static void countType(Instruction &I) {
+  if (auto *SI = dyn_cast<StoreInst>(&I)) {
+    NumStoreInst++;
+    if (SI->getValueOperand()->getType()->isVectorTy()) {
+      NumVectorStores++;
+    }
+  }
+
+  if (isa<AtomicRMWInst>(&I)) {
+    NumAtomicRMW++;
+  }
+
+  if (isa<AtomicCmpXchgInst>(&I)) {
+    NumCmpXchg++;
+  }
+
+  // memset/memcpy/memmove
+  if (isa<MemIntrinsic>(&I)) {
+    NumMemIntrinsics++;
+  }
+
+  if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::masked_store:
+      NumMaskedStore++;
+      break;
+    case Intrinsic::masked_scatter:
+      NumScatter++;
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+static void countUnhandled(Instruction &I) {
+  if (I.mayWriteToMemory()) {
+    if (auto *CB = dyn_cast<CallBase>(&I)) {
+      if (CB->isInlineAsm()) {
+        NumInlineAsm++;
+      } else if (isa<IntrinsicInst>(CB)) {
+        NumUnhandledWrites++;
+      } else if (auto *F = CB->getCalledFunction(); !F || F->isDeclaration()) {
+        NumExternalCallsMayWrite++;
+      }
+    }
+  }
+}
+
+static bool isAlreadyMasked(Value *P) {
+  auto *II = dyn_cast<IntrinsicInst>(P);
+  if (!II || II->getIntrinsicID() != Intrinsic::ptrmask) {
+    return false;
+  }
+
+  auto *C = dyn_cast<Constant>(II->getArgOperand(1));
+  if (!C) {
+    return false;
+  }
+
+  if (C->getType()->isVectorTy()) {
+    C = C->getSplatValue();
+  }
+
+  auto *CI = dyn_cast_or_null<ConstantInt>(C);
+  return CI && CI->getValue() == ClearMask;
+}
+
+bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
+  SmallVector<Use *, 8> Stores;
   for (auto &BB : F) {
     for (auto &I : BB) {
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
-        if (!SI->getMetadata("m-ignore")) {
-          Stores.push_back(SI);
+      auto o = getUse(I);
+      if (o.has_value()) {
+        auto U = o.value();
+        NumStoresSeen++;
+        if (isAlreadyMasked(U->get())) {
+          NumSkippedAlreadyMasked++;
+        } else {
+          countType(I);
+          Stores.push_back(U);
         }
+      } else {
+        countUnhandled(I);
       }
     }
   }
 
-  if (!Stores.empty()) {
-    NumFunctions++;
+  if (Stores.empty()) {
+    return false;
   }
 
+  NumFunctions++;
+  auto Changed = false;
   DenseMap<Value *, Value *> MaskedPtrs;
-  for (auto SI : Stores) {
-    instrumentStore(F, *SI, DT, MaskedPtrs);
+  for (auto S : Stores) {
+    Changed |= instrumentStore(F, *S, DT, MaskedPtrs);
   }
+
+  return Changed;
 }
 
-void SSFunctionPass::instrumentStore(Function &F, StoreInst &I,
-                                     DominatorTree &DT,
+bool SSFunctionPass::instrumentStore(Function &F, Use &U, DominatorTree &DT,
                                      DenseMap<Value *, Value *> &MaskedPtrs) {
-  NumStoresSeen++;
+  auto &I = *cast<Instruction>(U.getUser());
+
 #if defined(CONSTADDR_OPT)
-  if (isConstantAddressInObject(I, F.getParent()->getDataLayout())) {
+  if (auto *SI = dyn_cast<StoreInst>(&I);
+      SI && isConstantAddressInObject(*SI, F.getParent()->getDataLayout())) {
     NumSkippedConstAddr++;
-    return;
+    return false;
   }
 #endif
 #if defined(KNOWNBITS_OPT)
-  if (isGuardBitKnownZero(I, F.getParent()->getDataLayout(), DT)) {
+  if (isGuardBitKnownZero(U, F.getParent()->getDataLayout(), DT)) {
     NumSkippedKnownBits++;
-    return;
+    return false;
   }
 #endif
 #if defined(DOMTREE_OPT)
-  if (domTreeOpt(I, DT, MaskedPtrs)) {
+  if (domTreeOpt(U, DT, MaskedPtrs)) {
     NumSkippedDomTree++;
-    return;
+    return true;
   }
 #endif
 
   IRBuilder<> Builder(&I);
-  auto *DstPtr = I.getPointerOperand();
+  auto *DstPtr = U.get();
   auto *PtrTy = DstPtr->getType();
-#if defined(BTR_ASM)
-  auto *AsmTy = FunctionType::get(PtrTy, {PtrTy}, false);
-  auto *Btr = InlineAsm::get(AsmTy, "btrq $$47, $0", "=r,0,~{flags}", false);
-  auto *MaskedPtr = Builder.CreateCall(AsmTy, Btr, {DstPtr}, "masked_adr");
-#else
   auto *IdxTy = F.getParent()->getDataLayout().getIndexType(PtrTy);
   auto *MaskedPtr = Builder.CreateIntrinsic(
       Intrinsic::ptrmask, {PtrTy, IdxTy},
       {DstPtr, ConstantInt::get(IdxTy, ClearMask)}, nullptr, "masked_adr");
-#endif
-  I.setOperand(I.getPointerOperandIndex(), MaskedPtr);
+  U.set(MaskedPtr);
   MaskedPtrs[DstPtr] = MaskedPtr;
   NumStoresInstrumented++;
+  return true;
 }
 
 PreservedAnalyses SSReportPass::run(Module &M, ModuleAnalysisManager &MAM) {
-  static constexpr unsigned N = 6;
-  static uint64_t Prev[N];
-  uint64_t Now[N] = {NumFunctions,          NumStoresSeen,
-                     NumStoresInstrumented, NumSkippedConstAddr,
-                     NumSkippedKnownBits,   NumSkippedDomTree};
-  uint64_t D[N];
+  static uint64_t Prev[NumColumns];
+  uint64_t D[NumColumns];
+  for (size_t i = 0; i < NumColumns; ++i) {
+    uint64_t Now = Columns[i].Stat->getValue();
+    D[i] = Now - Prev[i];
+    Prev[i] = Now;
+  }
 
-  for (unsigned i = 0; i < N; ++i) {
-    D[i] = Now[i] - Prev[i];
-    Prev[i] = Now[i];
+  uint64_t Accounted = D[IdxAlreadyMasked] + D[IdxInstrumented] +
+                       D[IdxSkipConstAddr] + D[IdxSkipKnownBits] +
+                       D[IdxSkipDomTree];
+  if (Accounted != D[IdxSeen]) {
+    errs() << "WARNING: " << M.getSourceFileName() << ": seen=" << D[IdxSeen]
+           << " accounted=" << Accounted << "\n";
   }
 
   const auto Dest = std::getenv("SS_REPORT_DEST");
@@ -169,23 +361,26 @@ PreservedAnalyses SSReportPass::run(Module &M, ModuleAnalysisManager &MAM) {
   }
 
   if (StringRef(Dest) == "-") {
-    errs() << "[ss] " << M.getSourceFileName() << ": " << D[0] << " functions, "
-           << D[1] << " stores, " << D[2] << " masked (skipped: constaddr "
-           << D[3] << ", knownbits " << D[4] << ", domtree " << D[5] << ")\n";
+    errs() << M.getSourceFileName();
+    for (size_t i = 0; i < NumColumns; ++i) {
+      errs() << (i ? "," : ":") << Columns[i].Name << "=" << D[i];
+    }
+
+    errs() << "\n";
     return PreservedAnalyses::all();
   }
 
   std::error_code EC;
   raw_fd_ostream Out(Dest, EC, sys::fs::OF_Append | sys::fs::OF_Text);
   if (EC) {
-    errs() << "[ss] cannot open " << Dest << ": " << EC.message() << "\n";
+    errs() << "WARNING: cannot open " << Dest << ": " << EC.message() << "\n";
     return PreservedAnalyses::all();
   }
 
   std::string Line;
   raw_string_ostream L(Line);
   L << M.getSourceFileName();
-  for (unsigned i = 0; i < N; i++) {
+  for (unsigned i = 0; i < NumColumns; i++) {
     L << "," << D[i];
   }
   L << "\n";
@@ -198,7 +393,11 @@ llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "ShadowStack", "v0.1", [](PassBuilder &PB) {
             PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
                                                   OptimizationLevel OL,
-                                                  ThinOrFullLTOPhase) {
+                                                  ThinOrFullLTOPhase Phase) {
+              if (Phase == ThinOrFullLTOPhase::FullLTOPreLink ||
+                  Phase == ThinOrFullLTOPhase::ThinLTOPreLink)
+                return;
+
               MPM.addPass(createModuleToFunctionPassAdaptor(SSFunctionPass()));
               MPM.addPass(SSReportPass());
             });

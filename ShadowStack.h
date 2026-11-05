@@ -1,5 +1,5 @@
-#ifndef STRICT_OPT_H
-#define STRICT_OPT_H
+#ifndef _SHADOW_STACK_H
+#define _SHADOW_STACK_H
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PassManager.h"
@@ -8,18 +8,17 @@ namespace llvm {
 class Function;
 
 struct SSFunctionPass : public PassInfoMixin<SSFunctionPass> {
-  SSFunctionPass(bool instrumentFun = true, bool instrumentStore = true)
-      : _instrumentFun(instrumentFun), _instrumentStore(instrumentStore) {}
+  SSFunctionPass(bool instrumentStore = true)
+      : _instrumentStore(instrumentStore) {}
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 
 private:
-  bool _instrumentFun;
   bool _instrumentStore;
 
-  void instrumentStores(Function &F, DominatorTree &DT);
+  bool instrumentStores(Function &F, DominatorTree &DT);
 
-  void instrumentStore(Function &F, StoreInst &I, DominatorTree &DT,
+  bool instrumentStore(Function &F, Use &U, DominatorTree &DT,
                        DenseMap<Value *, Value *> &MaskedPtrs);
 };
 
