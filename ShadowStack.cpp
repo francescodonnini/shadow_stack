@@ -1,8 +1,10 @@
 #include "ShadowStack.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicsX86.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/FileSystem.h"
@@ -26,6 +28,7 @@ STATISTIC(NumMemIntrinsics, "Number of LLVM memory intrinsics");
 STATISTIC(NumMaskedStore, "Number of llvm.masked.store calls");
 STATISTIC(NumScatter, "Number of llvm.masked.scatter calls");
 STATISTIC(NumVectorStores, "Number of stores of vector type");
+STATISTIC(NumArchSpecificStores, "Number of x86 maskmov/maskstore intrinsics");
 STATISTIC(NumUnhandledWrites,
           "Number of arch-specific intrinsics not recognized by LLVM");
 STATISTIC(NumSkippedAlreadyMasked,
@@ -60,6 +63,7 @@ enum ColumnIndex : size_t {
   IdxMemIntrinsics,
   IdxMaskedStore,
   IdxScatter,
+  IdxArchSpecificStores,
   IdxUnhandledWrites,
   IdxInlineAsm,
   IdxExternalCalls,
@@ -81,6 +85,7 @@ static const ColumnValue Columns[] = {
     {"cmpxchg", &NumCmpXchg},
     {"mem_intrinsics", &NumMemIntrinsics},
     {"masked_store", &NumMaskedStore},
+    {"arch_specific", &NumArchSpecificStores},
     {"scatter", &NumScatter},
     {"unhandled_writes", &NumUnhandledWrites},
     {"inline_asm", &NumInlineAsm},
@@ -164,6 +169,25 @@ PreservedAnalyses SSFunctionPass::run(Function &F,
   return PA;
 }
 
+static std::optional<int> x86MaskedWritePtrIdx(Intrinsic::ID &ID) {
+  switch (ID) {
+  case Intrinsic::x86_sse2_maskmov_dqu:
+  case Intrinsic::x86_mmx_maskmovq:
+    return std::optional{2};
+  case Intrinsic::x86_avx_maskstore_pd:
+  case Intrinsic::x86_avx_maskstore_ps:
+  case Intrinsic::x86_avx_maskstore_pd_256:
+  case Intrinsic::x86_avx_maskstore_ps_256:
+  case Intrinsic::x86_avx2_maskstore_d:
+  case Intrinsic::x86_avx2_maskstore_q:
+  case Intrinsic::x86_avx2_maskstore_d_256:
+  case Intrinsic::x86_avx2_maskstore_q_256:
+    return std::optional{0};
+  default:
+    return std::nullopt;
+  }
+}
+
 static std::optional<Use *> getUse(Instruction &I) {
   if (auto *SI = dyn_cast<StoreInst>(&I)) {
     return std::optional{
@@ -186,13 +210,17 @@ static std::optional<Use *> getUse(Instruction &I) {
   }
 
   if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-    switch (II->getIntrinsicID()) {
+    auto ID = II->getIntrinsicID();
+    switch (ID) {
     case Intrinsic::masked_store:
       return std::optional{&II->getArgOperandUse(1)};
     case Intrinsic::masked_scatter:
       return std::optional{&II->getArgOperandUse(1)};
-    default:
       break;
+    default:
+      if (auto Idx = x86MaskedWritePtrIdx(ID)) {
+        return std::optional{&II->getArgOperandUse(*Idx)};
+      }
     }
   }
 
@@ -221,7 +249,8 @@ static void countType(Instruction &I) {
   }
 
   if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-    switch (II->getIntrinsicID()) {
+    auto ID = II->getIntrinsicID();
+    switch (ID) {
     case Intrinsic::masked_store:
       NumMaskedStore++;
       break;
@@ -229,22 +258,55 @@ static void countType(Instruction &I) {
       NumScatter++;
       break;
     default:
+      if (x86MaskedWritePtrIdx(ID)) {
+        NumArchSpecificStores++;
+      }
       break;
     }
   }
 }
 
+static bool isHarmlessIntrinsic(Intrinsic::ID ID) {
+  switch (ID) {
+  case Intrinsic::lifetime_start:
+  case Intrinsic::lifetime_end:
+  case Intrinsic::invariant_start:
+  case Intrinsic::invariant_end:
+  case Intrinsic::assume:
+  case Intrinsic::experimental_noalias_scope_decl:
+  case Intrinsic::sideeffect:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static void countUnhandled(Instruction &I) {
-  if (I.mayWriteToMemory()) {
-    if (auto *CB = dyn_cast<CallBase>(&I)) {
-      if (CB->isInlineAsm()) {
-        NumInlineAsm++;
-      } else if (isa<IntrinsicInst>(CB)) {
-        NumUnhandledWrites++;
-      } else if (auto *F = CB->getCalledFunction(); !F || F->isDeclaration()) {
-        NumExternalCallsMayWrite++;
-      }
+  if (!I.mayWriteToMemory()) {
+    return;
+  }
+
+  auto *CB = dyn_cast<CallBase>(&I);
+  if (!CB) {
+    return;
+  }
+
+  if (CB->isInlineAsm()) {
+    NumInlineAsm++;
+  } else if (auto *II = dyn_cast<IntrinsicInst>(CB)) {
+    if (isHarmlessIntrinsic(II->getIntrinsicID())) {
+      return;
     }
+
+    NumUnhandledWrites++;
+    static StringSet<> Warned;
+    auto Name = II->getCalledFunction()->getName();
+    if (Warned.insert(Name).second) {
+      errs() << "WARNING: unhandled memory-writing intrinsic " << Name
+             << " (first seen in " << I.getFunction()->getName() << ")\n";
+    }
+  } else if (auto *F = CB->getCalledFunction(); !F || F->isDeclaration()) {
+    NumExternalCallsMayWrite++;
   }
 }
 
