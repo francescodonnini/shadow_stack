@@ -1,4 +1,5 @@
 #include "ShadowStack.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -40,6 +41,9 @@ STATISTIC(NumSkippedKnownBits, "Number of masks skipped (Known Bits)");
 STATISTIC(NumSkippedDomTree, "Number of masks skipped (Dominator Tree)");
 STATISTIC(NumSkippedConstAddr,
           "Number of masks skipped (constant offset in a local or global)");
+STATISTIC(NumBaseSmallOff, "Stores at base + small constant offset");
+STATISTIC(NumDistinctBases, "Distinct bases of those stores (per function)");
+STATISTIC(NumNonZeroOff, "Stores at base + nonzero small constant offset");
 
 namespace {
 using TStat = std::remove_reference_t<decltype(NumFunctions)>;
@@ -67,6 +71,9 @@ enum ColumnIndex : size_t {
   IdxUnhandledWrites,
   IdxInlineAsm,
   IdxExternalCalls,
+  IdxBaseSmallOff,
+  IdxDistinctBases,
+  IdxNonZeroOff,
   IdxNum
 };
 } // namespace
@@ -90,6 +97,9 @@ static const ColumnValue Columns[] = {
     {"unhandled_writes", &NumUnhandledWrites},
     {"inline_asm", &NumInlineAsm},
     {"external_calls_may_write", &NumExternalCallsMayWrite},
+    {"base_small_off", &NumBaseSmallOff},
+    {"distinct_bases", &NumDistinctBases},
+    {"non_zero_off", &NumNonZeroOff},
 };
 static constexpr size_t NumColumns = std::size(Columns);
 static_assert(NumColumns == IdxNum,
@@ -329,8 +339,23 @@ static bool isAlreadyMasked(Value *P) {
   return CI && CI->getValue() == ClearMask;
 }
 
+static const Value *smallOffsetBase(Use &U, const DataLayout &DL) {
+  auto *Ptr = U.get();
+  if (!Ptr->getType()->isPointerTy()) // es. vettori di puntatori (scatter)
+    return nullptr;
+  APInt Off(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  auto *Base = Ptr->stripAndAccumulateConstantOffsets(DL, Off, true);
+  if (Off.abs().uge(4096))
+    return nullptr;
+  if (!Off.isZero())
+    NumNonZeroOff++;
+  return Base;
+}
+
 bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
+  SmallPtrSet<const Value *, 16> Bases;
   SmallVector<Use *, 8> Stores;
+  auto &DL = F.getParent()->getDataLayout();
   for (auto &BB : F) {
     for (auto &I : BB) {
       auto o = getUse(I);
@@ -342,6 +367,10 @@ bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
         } else {
           countType(I);
           Stores.push_back(U);
+          if (auto *B = smallOffsetBase(*U, DL)) {
+            NumBaseSmallOff++;
+            Bases.insert(B);
+          }
         }
       } else {
         countUnhandled(I);
@@ -360,6 +389,7 @@ bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
     Changed |= instrumentStore(F, *S, DT, MaskedPtrs);
   }
 
+  NumDistinctBases += Bases.size();
   return Changed;
 }
 
