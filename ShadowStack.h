@@ -14,6 +14,8 @@ struct SSFunctionPass : public PassInfoMixin<SSFunctionPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 
 private:
+  DenseMap<Value *, Value *> BaseMasks;
+
   bool _instrumentStore;
 
   bool instrumentStores(Function &F, DominatorTree &DT);
