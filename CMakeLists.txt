@@ -22,8 +22,8 @@ endif()
 add_llvm_pass_plugin(ShadowStack
     ShadowStack.cpp)
 
-option(OPT_CONSTADDR "Skip stores at constant offsets in locals/globals" ON)
-option(OPT_DOMTREE   "Reuse a dominating mask of the same pointer"       ON)
+option(OPT_CONSTADDR "Skip stores at constant offsets in locals/globals" OFF)
+option(OPT_DOMTREE   "Reuse a dominating mask of the same pointer"       OFF)
 option(OPT_KNOWNBITS "Skip stores whose bit 47 is known to be zero"      OFF)
 option(OPTS_ALL      "Enable all the optimizations above"                OFF)
 
