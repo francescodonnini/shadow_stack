@@ -44,6 +44,7 @@ STATISTIC(NumSkippedConstAddr,
 STATISTIC(NumBaseSmallOff, "Stores at base + small constant offset");
 STATISTIC(NumDistinctBases, "Distinct bases of those stores (per function)");
 STATISTIC(NumNonZeroOff, "Stores at base + nonzero small constant offset");
+STATISTIC(NumInPlace, "Stores masked through a shared base mask");
 
 namespace {
 using TStat = std::remove_reference_t<decltype(NumFunctions)>;
@@ -74,6 +75,7 @@ enum ColumnIndex : size_t {
   IdxBaseSmallOff,
   IdxDistinctBases,
   IdxNonZeroOff,
+  IdxInPlace,
   IdxNum
 };
 } // namespace
@@ -100,6 +102,7 @@ static const ColumnValue Columns[] = {
     {"base_small_off", &NumBaseSmallOff},
     {"distinct_bases", &NumDistinctBases},
     {"non_zero_off", &NumNonZeroOff},
+    {"inplace", &NumInPlace},
 };
 static constexpr size_t NumColumns = std::size(Columns);
 static_assert(NumColumns == IdxNum,
@@ -393,6 +396,33 @@ bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
   return Changed;
 }
 
+#if defined(INPLACE_OPT)
+static Value *maskedBaseFor(Value *Base, Function &F,
+                            DenseMap<Value *, Value *> &Cache) {
+  if (auto It = Cache.find(Base); It != Cache.end())
+    return It->second;
+
+  BasicBlock::iterator IP;
+  if (auto *I = dyn_cast<Instruction>(Base)) {
+    if (isa<InvokeInst>(I)) {
+      return nullptr;
+    }
+    IP = I->getParent()->getFirstInsertionPt();
+    if (!isa<PHINode>(I))
+      IP = std::next(I->getIterator());
+  } else {
+    IP = F.getEntryBlock().getFirstInsertionPt();
+  }
+
+  IRBuilder<> B(&*IP);
+  auto *IdxTy = F.getParent()->getDataLayout().getIndexType(Base->getType());
+  auto *M = B.CreateIntrinsic(Intrinsic::ptrmask, {Base->getType(), IdxTy},
+                              {Base, ConstantInt::get(IdxTy, ClearMask)},
+                              nullptr, "masked_base");
+  return Cache[Base] = M;
+}
+#endif
+
 bool SSFunctionPass::instrumentStore(Function &F, Use &U, DominatorTree &DT,
                                      DenseMap<Value *, Value *> &MaskedPtrs) {
   auto &I = *cast<Instruction>(U.getUser());
@@ -414,6 +444,26 @@ bool SSFunctionPass::instrumentStore(Function &F, Use &U, DominatorTree &DT,
   if (domTreeOpt(U, DT, MaskedPtrs)) {
     NumSkippedDomTree++;
     return true;
+  }
+#endif
+
+#if defined(INPLACE_OPT)
+  {
+    auto &DL = F.getParent()->getDataLayout();
+    auto *Ptr = U.get();
+    if (Ptr->getType()->isPointerTy()) {
+      APInt Off(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+      auto *Base = Ptr->stripAndAccumulateConstantOffsets(DL, Off, true);
+      if (Off.abs().ult(4096)) {
+        if (auto *MB = maskedBaseFor(Base, F, BaseMasks)) {
+          IRBuilder<> B(&I);
+          U.set(
+              B.CreatePtrAdd(MB, B.getInt64(Off.getSExtValue()), "masked_adr"));
+          NumInPlace++;
+          return true;
+        }
+      }
+    }
   }
 #endif
 
