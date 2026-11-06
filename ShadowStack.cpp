@@ -356,6 +356,7 @@ static const Value *smallOffsetBase(Use &U, const DataLayout &DL) {
 }
 
 bool SSFunctionPass::instrumentStores(Function &F, DominatorTree &DT) {
+  BaseMasks.clear();
   SmallPtrSet<const Value *, 16> Bases;
   SmallVector<Use *, 8> Stores;
   auto &DL = F.getParent()->getDataLayout();
@@ -404,7 +405,7 @@ static Value *maskedBaseFor(Value *Base, Function &F,
 
   BasicBlock::iterator IP;
   if (auto *I = dyn_cast<Instruction>(Base)) {
-    if (isa<InvokeInst>(I)) {
+    if (I->isTerminator()) {
       return nullptr;
     }
     IP = I->getParent()->getFirstInsertionPt();
@@ -491,7 +492,7 @@ PreservedAnalyses SSReportPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
   uint64_t Accounted = D[IdxAlreadyMasked] + D[IdxInstrumented] +
                        D[IdxSkipConstAddr] + D[IdxSkipKnownBits] +
-                       D[IdxSkipDomTree];
+                       D[IdxSkipDomTree] + D[IdxInPlace];
   if (Accounted != D[IdxSeen]) {
     errs() << "WARNING: " << M.getSourceFileName() << ": seen=" << D[IdxSeen]
            << " accounted=" << Accounted << "\n";
